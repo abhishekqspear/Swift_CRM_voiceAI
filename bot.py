@@ -118,19 +118,26 @@ class _PhoneBotGeminiService(GeminiLiveLLMService):
         self._client = get_shared_client()
 
     async def _handle_session_ready(self, session):
-        """Trigger greeting once Gemini session is live."""
+        """Trigger greeting once Gemini session is live.
+
+        send_client_content is used here intentionally — it must fire
+        immediately (no sleep) so it always arrives BEFORE any Silero
+        activity_start.  The 1-second sleep that was tried previously caused
+        random non-responses because it let activity_start arrive mid-greeting,
+        injecting send_client_content into an already-open audio turn.
+        """
         await super()._handle_session_ready(session)
         if self._session and not self._disconnecting:
             try:
                 from google.genai.types import Content, Part
                 greeting_turn = Content(
                     role="user",
-                    parts=[Part(text="Greet the caller warmly and ask how you can help them today.")],
+                    parts=[Part(text="The call has connected. Begin the conversation per your instructions.")],
                 )
                 await self._session.send_client_content(turns=[greeting_turn], turn_complete=True)
-                logger.debug("Sent initial greeting to Gemini")
+                logger.debug("Sent greeting trigger to Gemini")
             except Exception as e:
-                logger.warning(f"Initial greeting send failed: {e}")
+                logger.warning(f"Greeting trigger failed: {e}")
 
     async def _send_user_audio(self, frame):
         """Pre-buffer audio; only send to Gemini during active speech windows."""
@@ -236,6 +243,7 @@ class EarlyInterruptor(FrameProcessor):
         energy_threshold: int = 600,
         hold_frames: int = 3,
         cooldown_frames: int = 50,
+        echo_guard_frames: int = 30,   # ~600ms at 20ms/frame — ignore echo at turn start
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -243,9 +251,11 @@ class EarlyInterruptor(FrameProcessor):
         self._threshold = energy_threshold
         self._hold = hold_frames
         self._cooldown = cooldown_frames
+        self._echo_guard = echo_guard_frames
         self._bot_speaking = False
         self._high_energy_count = 0
         self._cooldown_count = 0
+        self._frames_since_armed = 0
         self._fired = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -257,6 +267,7 @@ class EarlyInterruptor(FrameProcessor):
                 self._fired = False
                 self._high_energy_count = 0
                 self._cooldown_count = 0
+                self._frames_since_armed = 0
                 logger.debug("EarlyInterruptor: armed (bot started speaking)")
             elif isinstance(frame, BotStoppedSpeakingFrame):
                 self._bot_speaking = False
@@ -264,6 +275,14 @@ class EarlyInterruptor(FrameProcessor):
                 logger.debug("EarlyInterruptor: disarmed (bot stopped speaking)")
 
         elif isinstance(frame, InputAudioRawFrame) and self._bot_speaking:
+            self._frames_since_armed += 1
+            if self._frames_since_armed <= self._echo_guard:
+                # Within the echo guard window — the bot just started speaking
+                # and any high-energy audio is likely echo of its own voice
+                # bouncing back through the phone line.  Skip detection.
+                await self.push_frame(frame, direction)
+                return
+
             audio = np.frombuffer(frame.audio, dtype=np.int16).astype(np.float32)
             rms = float(np.sqrt(np.mean(audio ** 2))) if len(audio) > 0 else 0.0
 
@@ -301,15 +320,22 @@ async def run_bot(
 ):
     """Run the Gemini Live bot for a single Plivo call."""
 
-    effective_prompt = system_prompt or os.getenv(
-        "SYSTEM_PROMPT",
-        (
-            "You are a friendly and helpful phone assistant. "
-            "Keep your answers concise — you are speaking on a phone call. "
-            "Avoid special characters, bullet points, or markdown formatting. "
-            "Respond naturally as if in a real conversation."
-        ),
+    # Load system prompt: explicit arg > .env SYSTEM_PROMPT > system_prompt.txt > hardcoded default
+    _prompt_file = os.path.join(os.path.dirname(__file__), "system_prompt.txt")
+    _file_prompt = ""
+    try:
+        with open(_prompt_file, "r", encoding="utf-8") as _f:
+            _file_prompt = _f.read().strip()
+    except Exception as _e:
+        logger.warning(f"Could not read system_prompt.txt: {_e}")
+
+    effective_prompt = (
+        system_prompt
+        or os.getenv("SYSTEM_PROMPT")
+        or _file_prompt
+        or 'You are a helpful assistant. Greet the caller and assist them.'
     )
+    logger.info(f"System prompt source: {'arg' if system_prompt else 'env' if os.getenv('SYSTEM_PROMPT') else 'file' if _file_prompt else 'default'} ({len(effective_prompt)} chars)")
 
     logger.info(f"Starting bot | stream_id={stream_id} call_id={call_id}")
 
@@ -352,10 +378,11 @@ async def run_bot(
     )
 
     # ── Gemini Live ───────────────────────────────────────────────────────────
+    logger.debug(f"system_instruction preview: {effective_prompt[:120]!r}")
     llm = _PhoneBotGeminiService(
         api_key=os.getenv("GOOGLE_API_KEY"),
+        system_instruction=effective_prompt,  # must be direct param — Settings path skips _system_instruction_from_init
         settings=GeminiLiveLLMService.Settings(
-            system_instruction=effective_prompt,
             voice="Puck",  # Aoede | Charon | Fenrir | Kore | Puck
             vad=GeminiVADParams(
                 disabled=True,  # Silero owns all VAD
